@@ -10,7 +10,27 @@ from math import floor
 from matplotlib import pyplot as plt
 from scipy import interpolate
 
+
+def bilinear_grid_interpolate(values, x_coords, y_coords):
+    """Bilinear interpolation on a regular 2D grid, compatible with SciPy >= 1.14."""
+    y_points = np.asarray(y_coords)
+    x_points = np.asarray(x_coords)
+    y_grid = np.linspace(0, values.shape[0] - 1, values.shape[0])
+    x_grid = np.linspace(0, values.shape[1] - 1, values.shape[1])
+    interpolator = interpolate.RegularGridInterpolator(
+        (y_grid, x_grid),
+        values,
+        method='linear',
+        bounds_error=False,
+        fill_value=None,
+    )
+    yy, xx = np.meshgrid(y_points, x_points, indexing='ij')
+    pts = np.stack([yy.ravel(), xx.ravel()], axis=1)
+    return interpolator(pts).reshape(len(y_points), len(x_points))
+
+
 args = gettestargs()
+# args.plot = True
 
 # Define parameters
 R = 2
@@ -28,7 +48,7 @@ patchmargin = floor(patchsize/2)
 gradientmargin = floor(gradientsize/2)
 
 # Read filter from file
-filtername = 'filter.p'
+filtername = 'filters/filter_BSDS500'
 if args.filter:
     filtername = args.filter
 with open(filtername, "rb") as fp:
@@ -61,10 +81,9 @@ for image in imagelist:
     heightLR, widthLR = grayorigin.shape
     heightgridLR = np.linspace(0,heightLR-1,heightLR)
     widthgridLR = np.linspace(0,widthLR-1,widthLR)
-    bilinearinterp = interpolate.interp2d(widthgridLR, heightgridLR, grayorigin, kind='linear')
     heightgridHR = np.linspace(0,heightLR-0.5,heightLR*2)
     widthgridHR = np.linspace(0,widthLR-0.5,widthLR*2)
-    upscaledLR = bilinearinterp(widthgridHR, heightgridHR)
+    upscaledLR = bilinear_grid_interpolate(grayorigin, widthgridHR, heightgridHR)
     # Calculate predictHR pixels
     heightHR, widthHR = upscaledLR.shape
     predictHR = np.zeros((heightHR-2*margin, widthHR-2*margin))
@@ -94,14 +113,11 @@ for image in imagelist:
     # Bilinear interpolation on CbCr field
     result = np.zeros((heightHR, widthHR, 3))
     y = ycrcvorigin[:,:,0]
-    bilinearinterp = interpolate.interp2d(widthgridLR, heightgridLR, y, kind='linear')
-    result[:,:,0] = bilinearinterp(widthgridHR, heightgridHR)
+    result[:,:,0] = bilinear_grid_interpolate(y, widthgridHR, heightgridHR)
     cr = ycrcvorigin[:,:,1]
-    bilinearinterp = interpolate.interp2d(widthgridLR, heightgridLR, cr, kind='linear')
-    result[:,:,1] = bilinearinterp(widthgridHR, heightgridHR)
+    result[:,:,1] = bilinear_grid_interpolate(cr, widthgridHR, heightgridHR)
     cv = ycrcvorigin[:,:,2]
-    bilinearinterp = interpolate.interp2d(widthgridLR, heightgridLR, cv, kind='linear')
-    result[:,:,2] = bilinearinterp(widthgridHR, heightgridHR)
+    result[:,:,2] = bilinear_grid_interpolate(cv, widthgridHR, heightgridHR)
     result[margin:heightHR-margin,margin:widthHR-margin,0] = predictHR
     result = cv2.cvtColor(np.uint8(result), cv2.COLOR_YCrCb2RGB)
     cv2.imwrite('results/' + os.path.splitext(os.path.basename(image))[0] + '_result.bmp', cv2.cvtColor(result, cv2.COLOR_RGB2BGR))

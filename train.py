@@ -13,6 +13,25 @@ from matplotlib import pyplot as plt
 from scipy import interpolate
 from skimage import transform
 
+
+def bilinear_grid_interpolate(values, x_coords, y_coords):
+    """Bilinear interpolation on a regular 2D grid, compatible with SciPy >= 1.14."""
+    y_points = np.asarray(y_coords)
+    x_points = np.asarray(x_coords)
+    y_grid = np.linspace(0, values.shape[0] - 1, values.shape[0])
+    x_grid = np.linspace(0, values.shape[1] - 1, values.shape[1])
+    interpolator = interpolate.RegularGridInterpolator(
+        (y_grid, x_grid),
+        values,
+        method='linear',
+        bounds_error=False,
+        fill_value=None,
+    )
+    yy, xx = np.meshgrid(y_points, x_points, indexing='ij')
+    pts = np.stack([yy.ravel(), xx.ravel()], axis=1)
+    return interpolator(pts).reshape(len(y_points), len(x_points))
+
+
 args = gettrainargs()
 
 # Define parameters
@@ -72,10 +91,9 @@ for image in imagelist:
     height, width = LR.shape
     heightgrid = np.linspace(0, height-1, height)
     widthgrid = np.linspace(0, width-1, width)
-    bilinearinterp = interpolate.interp2d(widthgrid, heightgrid, LR, kind='linear')
     heightgrid = np.linspace(0, height-1, height*2-1)
     widthgrid = np.linspace(0, width-1, width*2-1)
-    upscaledLR = bilinearinterp(widthgrid, heightgrid)
+    upscaledLR = bilinear_grid_interpolate(LR, widthgrid, heightgrid)
     # Calculate A'A, A'b and push them into Q, V
     height, width = upscaledLR.shape
     operationcount = 0
