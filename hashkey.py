@@ -36,8 +36,8 @@ def hashkey(block, Qangle, W):
     lamda = w[0]
 
     # Calculate u
-    sqrtlamda1 = np.sqrt(w[0])
-    sqrtlamda2 = np.sqrt(w[1])
+    sqrtlamda1 = np.sqrt(max(float(w[0]), 0.0))
+    sqrtlamda2 = np.sqrt(max(float(w[1]), 0.0))
     if sqrtlamda1 + sqrtlamda2 == 0:
         u = 0
     else:

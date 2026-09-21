@@ -1,8 +1,12 @@
 import argparse
+import os
 
-def gettestargs():
+
+def gettestargs(argv=None):
+    root = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser()
-    parser.add_argument("-f", "--filter", help="Use file as filter")
-    parser.add_argument("-p", "--plot", help="Visualizing the process of RAISR image upscaling", action="store_true")
-    args = parser.parse_args()
-    return args
+    parser.add_argument("-f", "--filter", default=os.path.join(root, "filter_aligned.p"))
+    parser.add_argument("-p", "--plot", action="store_true", help="Plot upscaling results")
+    parser.add_argument("--input-dir", default=os.path.join(root, "test"))
+    parser.add_argument("--output-dir", default=os.path.join(root, "results"))
+    return parser.parse_args(argv)

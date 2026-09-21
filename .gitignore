@@ -1,6 +1,9 @@
 train/*
 test/*
 results/*
+bicubic_results/*
+bilinear_results/*
+BSR
 __pycache__
 *.p
 
