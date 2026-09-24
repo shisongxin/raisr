@@ -6,6 +6,7 @@ bilinear_results/*
 BSR
 __pycache__
 *.p
+p0_samples
 
 # Except these files...
 !train/README.md
