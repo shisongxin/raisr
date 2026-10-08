@@ -5,7 +5,7 @@ import cv2
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--clean', default="D:\\raisr\\p0_samples\\clean", help='Path to the directory containing clean images')
-parser.add_argument('--denoised', default="D:\\raisr\\p0_samples\\results", help='Path to the directory containing denoised images')
+parser.add_argument('--denoised', default="D:\\raisr\\p0_samples\\results_50000", help='Path to the directory containing denoised images')
 args = parser.parse_args()
 
 def psnr(ref, pred, data_range=1.0):

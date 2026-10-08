@@ -60,8 +60,8 @@ def nlm_y(y_u8, sigma_noise):
     """
     h = float(1.1 * sigma_noise)
     return cv2.fastNlMeansDenoising(y_u8, None, h=h,
-                                    templateWindowSize=PATCHSIZE,
-                                    searchWindowSize=21)
+                                    templateWindowSize=5,
+                                    searchWindowSize=PATCHSIZE)
 
 
 def process_one(path, sigma, bilat_dir, nlm_dir):
