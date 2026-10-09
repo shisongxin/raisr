@@ -14,6 +14,7 @@ import time
 import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter
+from skimage.restoration import denoise_nl_means
 
 from cgls import cgls
 from filterplot import filterplot
@@ -28,8 +29,8 @@ GRADSIZE     = 5           # gradient block side length
 QANGLE       = 24
 QSTRENGTH    = 3
 QCOHERENCE   = 3
-PATCHMARGIN  = PATCHSIZE  // 2   # 5
-GRADMARGIN   = GRADSIZE   // 2   # 4
+PATCHMARGIN  = PATCHSIZE  // 2   # 3
+GRADMARGIN   = GRADSIZE   // 2   # 2
 N_FILTERS    = QANGLE * QSTRENGTH * QCOHERENCE   # 216
 PATCH_AREA   = PATCHSIZE * PATCHSIZE
 
@@ -51,15 +52,15 @@ def get_args():
                    help="Max center positions per image (0 = all pixels)")
     p.add_argument("--hash-mode",         default="nlm", choices=["gaussian","nlm"],
                    help="Lightweight preprocessing applied to the noisy image "
-                        "before hashing: 'gaussian' (default) applies a small "
-                        "Gaussian smooth (see --guide-sigma); 'nlm' applies a "
-                        "light non-local-means denoise (see --nlm-h).")
+                        "before hashing: 'nlm' (default) applies a light "
+                        "non-local-means denoise (see --nlm-h); 'gaussian' "
+                        "applies a small Gaussian smooth (see --guide-sigma).")
     p.add_argument("--guide-sigma",       type=float, default=0.8,
                    help="Gaussian sigma for --hash-mode gaussian pre-smoothing (pixels)")
     p.add_argument("--nlm-h",             type=float, default=None,
                    help="NLM filter strength h for --hash-mode nlm, in 8-bit "
-                        "intensity units (default: 1.1 x --sigma, matching "
-                        "denoise_baselines.py)")
+                        "gray-level units (default: 0.8 x --sigma; matched to "
+                        "the --guide-sigma 0.8 gaussian guide fidelity)")
     p.add_argument("--regularization",    type=float, default=1e-4,
                    help="Ridge regularization coefficient for cgls solver")
     p.add_argument("--adaptive-reg",     action="store_true",
@@ -160,24 +161,27 @@ def classify_pixels_by_structure(hash_src, flat_thresh_pct=60.0,
 
 
 def make_nlm_guide(noisy, h):
-    """NLM-denoised guide for hash computation (lightweight, see NLM_* constants)."""
-    img8 = np.clip(noisy * 255.0, 0.0, 255.0).astype(np.uint8)
-    den = cv2.fastNlMeansDenoising(img8, None, h=h,
-                                   templateWindowSize=NLM_TEMPLATE_WIN,
-                                   searchWindowSize=NLM_SEARCH_WIN)
-    return den.astype(np.float64) / 255.0
+    """NLM-denoised guide for hash computation.
+
+    Float-domain non-local means (skimage): no uint8 round-trip, so the guide
+    keeps continuous gradients for the structure-tensor hash. `h` is in 8-bit
+    gray-level units and is converted to the float [0,1] scale used here.
+    """
+    return denoise_nl_means(noisy, patch_size=NLM_TEMPLATE_WIN,
+                            patch_distance=NLM_RADIUS,
+                            h=h / 255.0, fast_mode=True)
 
 
-def make_guide(noisy, args):
+def make_guide(noisy, hash_mode, guide_sigma=0.8, nlm_h=None):
     """Return the hash source after the requested lightweight preprocessing.
 
-    'gaussian': light Gaussian smooth (sigma from --guide-sigma).
-    'nlm':      light non-local-means denoise (strength from --nlm-h).
+    'gaussian'/'guided': light Gaussian smooth (sigma from --guide-sigma).
+    'nlm':               light non-local-means denoise (strength from --nlm-h).
     """
-    if args.hash_mode == "gaussian":
-        return gaussian_filter(noisy, sigma=args.guide_sigma, mode='reflect')
-    if args.hash_mode == "nlm":
-        return make_nlm_guide(noisy, args.nlm_h)
+    if hash_mode in ("gaussian", "guided"):
+        return gaussian_filter(noisy, sigma=guide_sigma, mode='reflect')
+    if hash_mode == "nlm":
+        return make_nlm_guide(noisy, nlm_h if nlm_h is not None else 20.0)
     return noisy
 
 
@@ -202,7 +206,7 @@ def _sample_real_lamda_and_u(imagelist, weighting, sigma_f, args):
         except IOError:
             continue
         noisy = clean + rng.normal(0.0, sigma_f, size=clean.shape)
-        hash_src = make_guide(noisy, args)
+        hash_src = make_guide(noisy, args.hash_mode, args.guide_sigma, args.nlm_h)
         hash_pad = reflect_pad(hash_src, GRADMARGIN)
         H, W = clean.shape
         n = min(args.calib_samples, H * W)
@@ -224,43 +228,68 @@ def _sample_real_lamda_and_u(imagelist, weighting, sigma_f, args):
     return np.array(lamdas), np.array(us)
 
 
-def _estimate_noise_floor(weighting, sigma_f, args, n_mc=100000):
-    """Monte-Carlo lambda distribution of pure AWGN on a flat patch.
+FLAT_GRAD_THRESH = 2.0 / 255.0   # clean |grad| below this = locally flat
 
-    In a flat region the clean gradient is zero, so lambda is produced entirely
-    by the noise. This distribution is the physical anchor for the LOW strength
-    threshold: below its upper tail, an observed lambda is indistinguishable
-    from pure noise, i.e. the region is smooth. The same hash preprocessing
-    (--hash-mode) is applied to each synthetic noise patch so the floor matches
-    the hash source seen at training time.
+
+def _sample_real_flat_lamda(imagelist, weighting, sigma_f, args,
+                            n_per_image=2000):
+    """Lambda of genuinely flat clean regions after the hash preprocessing.
+
+    This is the physical noise floor: where the clean image is locally flat the
+    true gradient is zero, so lambda comes only from the noise that survives the
+    same lightweight preprocessing used for hashing. Sampling real flat regions
+    (instead of synthetic pure-noise patches) keeps the floor consistent with
+    content-dependent preprocessing such as NLM, which denoises a structureless
+    patch far more aggressively than a real flat region.
+    """
+    calib_paths = imagelist[:min(args.calib_images, len(imagelist))]
+    lamdas = []
+    for idx, path in enumerate(calib_paths):
+        ss = np.random.SeedSequence(1234, spawn_key=(0xF1A7, idx))
+        rng = np.random.default_rng(ss)
+        try:
+            clean = load_gray(path)
+        except IOError:
+            continue
+        noisy = clean + rng.normal(0.0, sigma_f, size=clean.shape)
+        hash_src = make_guide(noisy, args.hash_mode, args.guide_sigma, args.nlm_h)
+        hash_pad = reflect_pad(hash_src, GRADMARGIN)
+        # Flatness is judged on the CLEAN image so noise cannot make a flat
+        # region look structured (or vice versa).
+        gy, gx = np.gradient(clean)
+        mag = gaussian_filter(np.sqrt(gx * gx + gy * gy), sigma=1.0, mode='reflect')
+        flat_r, flat_c = np.where(mag < FLAT_GRAD_THRESH)
+        if flat_r.size == 0:
+            continue
+        n = min(n_per_image, flat_r.size)
+        pick = rng.choice(flat_r.size, size=n, replace=False)
+        for k in pick:
+            r, c = int(flat_r[k]), int(flat_c[k])
+            rg, cg = r + GRADMARGIN, c + GRADMARGIN
+            block = hash_pad[rg - GRADMARGIN: rg + GRADMARGIN + 1,
+                             cg - GRADMARGIN: cg + GRADMARGIN + 1]
+            lamdas.append(_lamda_of(block, weighting))
+        print_progress(idx, len(calib_paths))
+    print()
+    return np.array(lamdas)
+
+
+def _estimate_noise_floor(weighting, sigma_f, args, n_mc=100000):
+    """Synthetic fallback: lambda of pure AWGN on a flat patch.
+
+    Only used when too few flat regions are found in the calibration images
+    (see _sample_real_flat_lamda). The same hash preprocessing is applied to
+    each synthetic noise patch, on a slightly larger tile so smoothing edge
+    effects match reflect-padding behaviour, then cropped to GRADSIZE.
     """
     rng = np.random.default_rng(np.random.SeedSequence(1234, spawn_key=(0xF100,)))
     lamdas = np.empty(n_mc)
-    if args.hash_mode == "gaussian":
-        # Generate on a slightly larger tile when smoothing so edge effects of the
-        # Gaussian match reflect-padding behaviour, then crop to GRADSIZE.
-        pad = GRADMARGIN
-        size = GRADSIZE + 2 * pad
-        for i in range(n_mc):
-            patch = rng.normal(0.0, sigma_f, size=(size, size))
-            patch = gaussian_filter(patch, sigma=args.guide_sigma, mode='reflect')
-            patch = patch[pad:pad + GRADSIZE, pad:pad + GRADSIZE]
-            lamdas[i] = _lamda_of(patch, weighting)
-    elif args.hash_mode == "nlm":
-        # NLM smears intensity over its search window; generate on a larger tile
-        # so the cropped centre sees the same statistics as a pixel deep inside
-        # a real image, then crop to GRADSIZE.
-        pad = NLM_RADIUS
-        size = GRADSIZE + 2 * pad
-        for i in range(n_mc):
-            patch = rng.normal(0.0, sigma_f, size=(size, size))
-            patch = make_nlm_guide(patch, args.nlm_h)
-            patch = patch[pad:pad + GRADSIZE, pad:pad + GRADSIZE]
-            lamdas[i] = _lamda_of(patch, weighting)
-    else:  # hash directly on the noisy image
-        for i in range(n_mc):
-            patch = rng.normal(0.0, sigma_f, size=(GRADSIZE, GRADSIZE))
-            lamdas[i] = _lamda_of(patch, weighting)
+    pad = GRADMARGIN
+    size = GRADSIZE + 2 * pad
+    for i in range(n_mc):
+        patch = rng.normal(0.0, sigma_f, size=(size, size))
+        guide = make_guide(patch, args.hash_mode, args.guide_sigma, args.nlm_h)
+        lamdas[i] = _lamda_of(guide[pad:pad + GRADSIZE, pad:pad + GRADSIZE], weighting)
     return lamdas
 
 
@@ -284,7 +313,11 @@ def calibrate_strength_thresholds(imagelist, weighting, sigma_f, args):
         s_low  = float(np.percentile(real_l, 100.0 / 3.0))
         s_high = float(np.percentile(real_l, 200.0 / 3.0))
     else:  # noise-floor
-        floor = _estimate_noise_floor(weighting, sigma_f, args)
+        floor = _sample_real_flat_lamda(imagelist, weighting, sigma_f, args)
+        if floor.size < 100:
+            print(f"  [WARN] only {floor.size} flat-region samples; "
+                  f"falling back to synthetic noise floor")
+            floor = _estimate_noise_floor(weighting, sigma_f, args)
         s_low = float(np.percentile(floor, args.calib_low_pct))
         signal_l = real_l[real_l > s_low]
         s_high = float(np.percentile(signal_l, args.calib_high_pct)) \
@@ -336,7 +369,7 @@ def print_progress(done, total):
 def accumulate(noisy_pad, hash_pad, clean_orig,
                center_rows, center_cols,
                Q, V, counts,
-               weighting, args, strength_thresholds):
+               weighting, strength_thresholds, coherence_thresholds):
     """Accumulate Q, V, counts for the selected center positions."""
     n_pos = len(center_rows)
     for i, (row, col) in enumerate(zip(center_rows, center_cols)):
@@ -357,7 +390,8 @@ def accumulate(noisy_pad, hash_pad, clean_orig,
 
         angle, strength, coherence = hashkey(gblock, QANGLE, weighting,
                                              mode='denoise',
-                                             strength_thresholds=strength_thresholds)
+                                             strength_thresholds=strength_thresholds,
+                                             coherence_thresholds=coherence_thresholds)
 
         label = clean_orig[row, col]
 
@@ -519,7 +553,7 @@ def main():
     # Resolve the NLM strength default now so the resolved value flows into
     # calibration, metadata and the header print (sigma is in [0,255] scale).
     if args.nlm_h is None:
-        args.nlm_h = float(1.1 * args.sigma)
+        args.nlm_h = float(0.8 * args.sigma)
 
     sigma_f = args.sigma / 255.0
     os.makedirs(args.output_dir, exist_ok=True)
@@ -626,7 +660,7 @@ def main():
         noisy = clean + rng.normal(0.0, sigma_f, size=clean.shape)
 
         # Lightweight-preprocess the hash source (gaussian smoothing or NLM)
-        hash_src = make_guide(noisy, args)
+        hash_src = make_guide(noisy, args.hash_mode, args.guide_sigma, args.nlm_h)
 
         # Reflect-pad both noisy (for patches) and hash source (for gradient blocks)
         noisy_pad    = reflect_pad(noisy,    PATCHMARGIN)
@@ -706,7 +740,7 @@ def main():
         accumulate(noisy_pad, hash_pad, clean,
                    center_rows, center_cols,
                    Q, V, counts,
-                   weighting, args, strength_thresholds)
+                   weighting, strength_thresholds, coherence_thresholds)
 
         completed_images.add(image_path)
 
@@ -748,6 +782,7 @@ def main():
         "hash_mode":        args.hash_mode,
         "guide_sigma":      args.guide_sigma if args.hash_mode == "gaussian" else None,
         "nlm_h":            args.nlm_h if args.hash_mode == "nlm" else None,
+        "nlm_backend":      "skimage-float" if args.hash_mode == "nlm" else None,
         "strength_thresholds":  list(strength_thresholds),
         "coherence_thresholds": list(coherence_thresholds),
         "calib_method":     (None if args.no_calibrate else args.calib_method),

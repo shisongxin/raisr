@@ -12,11 +12,10 @@ import time
 
 import cv2
 import numpy as np
-from scipy.ndimage import gaussian_filter
 
 from gaussian2d import gaussian2d
 from hashkey import hashkey
-from train_denoise import PATCHSIZE, GRADSIZE, print_progress
+from train_denoise import PATCHSIZE, GRADSIZE, make_guide, print_progress
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +90,7 @@ def denoise(noisy, model, blend_width=0.0, blend_flat=False):
     Qangle     = model["Qangle"]
     hash_mode  = model.get("hash_mode", "noisy")
     guide_sigma = model.get("guide_sigma") or 0.8
+    nlm_h       = model.get("nlm_h") or 0.8 * model.get("sigma", 25.0)
     # Use the thresholds the model was trained with; fall back to SR defaults
     # only for legacy models that predate calibration.
     strength_thresholds  = tuple(model.get("strength_thresholds",  (0.0001, 0.001)))
@@ -103,11 +103,8 @@ def denoise(noisy, model, blend_width=0.0, blend_flat=False):
 
     H, W = noisy.shape
 
-    # Build guide if needed
-    if hash_mode == "guided":
-        hash_src = gaussian_filter(noisy, sigma=guide_sigma, mode='reflect')
-    else:
-        hash_src = noisy
+    # Lightweight preprocessing for the hash (must match training exactly)
+    hash_src = make_guide(noisy, hash_mode, guide_sigma, nlm_h)
 
     # Reflect-pad
     noisy_pad = np.pad(noisy,    pmargin, mode='reflect')
@@ -270,6 +267,9 @@ def main():
 
     print(f"  sigma={model['sigma']}, hash_mode={model.get('hash_mode','noisy')}, "
           f"patchsize={model['patchsize']}")
+    if model.get("hash_mode") == "nlm" and model.get("nlm_backend") != "skimage-float":
+        print("  [WARN] model was trained with the old quantised NLM guide; "
+              "the hash source will differ at inference. Retrain recommended.")
 
     # Load noisy input. For a regular image also keep the original Cr/Cb
     # channels so the denoised Y can be recombined into a color output that
@@ -287,7 +287,8 @@ def main():
             for filename in filenames:
                 if filename.lower().endswith(('.bmp', '.dib', '.png', '.jpg', '.jpeg', '.pbm', '.pgm', '.ppm', '.tif', '.tiff')):
                     clean.append(os.path.join(parent, filename))
-         
+
+    os.makedirs(args.output, exist_ok=True)
     imagecount = 1
     for image in imagelist:
         print('\r', end='')
@@ -342,9 +343,10 @@ def main():
                         np.abs(clean_ref - denoised.clip(0,1))]
                 titles = ["Clean", "Noisy", "Denoised", "Absolute error"]
             else:
-                guide_sigma = model.get("guide_sigma") or 0.8
-                from scipy.ndimage import gaussian_filter as _gf
-                guide = _gf(noisy, sigma=guide_sigma, mode='reflect')
+                guide = make_guide(noisy,
+                                   model.get("hash_mode", "noisy"),
+                                   model.get("guide_sigma") or 0.8,
+                                   model.get("nlm_h") or 0.8 * model.get("sigma", 25.0))
                 residual = noisy - denoised.clip(0, 1)
                 imgs   = [noisy, guide, denoised.clip(0,1), residual]
                 titles = ["Noisy", "Guide", "Denoised", "Noisy - Denoised (residual)"]
