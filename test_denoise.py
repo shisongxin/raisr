@@ -15,7 +15,8 @@ import numpy as np
 
 from gaussian2d import gaussian2d
 from hashkey import hashkey
-from train_denoise import PATCHSIZE, GRADSIZE, make_guide, print_progress
+from train_denoise import (PATCHSIZE, GRADSIZE, default_guide_sigma,
+                           default_nlm_h, make_guide, print_progress)
 
 
 # ---------------------------------------------------------------------------
@@ -31,8 +32,8 @@ GRADMARGIN  = GRADSIZE  // 2   # 4
 def get_args():
     p = argparse.ArgumentParser(description="Apply RAISR denoising filters")
     p.add_argument("-f", "--filter", required=True,
-                   help="Path to denoise_sigma*_filter.p model file")
-    p.add_argument("--input",        default="D:\\raisr\\p0_samples\\noisy",
+                   help="Path to denoise_filter.p model file")
+    p.add_argument("--input",        default="D:\\raisr\\p0_samples\\noisy\\noisy_25",
                    help="Input image path (noisy) or .npy float file")
     p.add_argument("--reference",    default=None,
                    help="Optional clean reference image for PSNR/SSIM")
@@ -51,8 +52,133 @@ def get_args():
                         "the 24 direction filters instead of picking one. "
                         "Reduces direction-bucket switching artefacts in "
                         "featureless areas.")
+    p.add_argument("--sigma",        type=float, default=None,
+                   help="Noise sigma of the input in 8-bit gray-level units. "
+                        "Selects (or interpolates) the matching filter bank "
+                        "among the model's noise levels. Required unless "
+                        "--blind.")
+    p.add_argument("--blind",        action="store_true",
+                   help="Estimate the input noise level per image (median "
+                        "Immerkaer with clipping compensation; wavelet MAD and "
+                        "textbook Immerkaer printed as cross-checks) and select "
+                        "the matching filter bank. Enables blind denoising.")
+    p.add_argument("--interp-noise",
+                   action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Blend filter coefficients between the two noise "
+                        "levels bracketing the selected sigma instead of hard "
+                        "nearest-level selection. Bucketing still uses the "
+                        "nearest level's thresholds. On by default: on the "
+                        "acceptance set this was worth +0.9 dB at sigma=20 and "
+                        "+1.3 dB at sigma=35 versus hard selection. Use "
+                        "--no-interp-noise for the hard nearest-level baseline.")
     return p.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Noise estimation and noise-level selection
+# ---------------------------------------------------------------------------
+def estimate_sigma_mad(noisy):
+    """Wavelet-MAD noise estimate (skimage), in 8-bit gray-level units.
+
+    Falls back to a Haar-wavelet MAD when PyWavelets is unavailable: the
+    median absolute deviation of the diagonal detail coefficients divided by
+    0.6745 (Donoho-Johnstone), which is robust to sparse edges.
+    """
+    try:
+        from skimage.restoration import estimate_sigma
+        try:
+            s = estimate_sigma(noisy, channel_axis=None)
+        except TypeError:   # older skimage: multichannel instead of channel_axis
+            s = estimate_sigma(noisy, multichannel=False)
+        return float(s) * 255.0
+    except ImportError:
+        h, w = noisy.shape
+        h2, w2 = h - h % 2, w - w % 2
+        d = (noisy[:h2:2, :w2:2] - noisy[:h2:2, 1:w2:2]
+             - noisy[1:h2:2, :w2:2] + noisy[1:h2:2, 1:w2:2])
+        # std(d) = 2*sigma (four +-1 taps), MAD of a Gaussian = 0.6745*std.
+        return float(np.median(np.abs(d)) / (0.6745 * 2.0)) * 255.0
+
+
+def estimate_sigma_immerkaer(noisy):
+    """Immerkaer (1996) Laplacian noise estimate, in 8-bit gray-level units.
+
+    sigma_hat = sqrt(pi/2) / 6 * mean(|I * L|), L the 3x3 Laplacian kernel.
+    Fast cross-check for the wavelet-MAD estimate; overestimates on textured
+    images because edges leak into the mean of the high-pass response.
+    """
+    return float(np.sqrt(np.pi / 2.0) * np.mean(np.abs(_lap_response(noisy)))
+                 / 6.0) * 255.0
+
+
+def _lap_response(noisy):
+    """3x3 valid response of L = [[1,-2,1],[-2,4,-2],[1,-2,1]] (std 6*sigma)."""
+    return (noisy[:-2, :-2] - 2.0 * noisy[:-2, 1:-1] + noisy[:-2, 2:]
+            - 2.0 * noisy[1:-1, :-2] + 4.0 * noisy[1:-1, 1:-1] - 2.0 * noisy[1:-1, 2:]
+            + noisy[2:, :-2] - 2.0 * noisy[2:, 1:-1] + noisy[2:, 2:])
+
+
+def clip_rail_fraction(noisy):
+    """Fraction of samples pinned at the display rails (0 or 1).
+
+    Returns 0 for unclipped float data (values strictly outside [0, 1]) so the
+    compensation below only fires on quantised/clipped 8-bit inputs.
+    """
+    if float(noisy.min()) < 0.0 or float(noisy.max()) > 1.0:
+        return 0.0
+    return float(np.mean((noisy <= 0.0) | (noisy >= 1.0)))
+
+
+# Variance-loss coefficient for the rail-occupancy compensation below,
+# calibrated on 250 crops of runs/eval/sigmahat (see verify_sigmahat.py).
+CLIP_COMP_COEF = 1.5
+
+
+def estimate_sigma_robust(noisy):
+    """Primary blind estimator: median Immerkaer + clipping compensation.
+
+    Two systematic errors dominate a plain high-pass MAD on 8-bit inputs:
+
+    - Texture leaks into the high-pass response and inflates the *mean*, so a
+      median replaces it (std of the 3x3 Laplacian response is 6*sigma).
+    - Dynamic-range clipping destroys real noise variance at high sigma (at
+      sigma=50 a plain estimate runs ~10% low). The lost variance grows with
+      the fraction of rail-pinned samples, so scale it back by
+      1/sqrt(1 - CLIP_COMP_COEF * q). Unclipped float data gives q = 0.
+    """
+    resp = _lap_response(noisy)
+    s0 = float(np.median(np.abs(resp)) / (0.6745 * 6.0)) * 255.0
+    q = clip_rail_fraction(noisy)
+    return s0 / np.sqrt(max(1e-3, 1.0 - CLIP_COMP_COEF * q))
+
+
+def resolve_noise_bank(levels, sigma, interp=False):
+    """Map a (possibly continuous) sigma onto the model's noise levels.
+
+    Returns (lo, hi, t, near): the effective filter bank is
+    (1-t)*h[lo] + t*h[hi]; `near` is the level whose thresholds are
+    authoritative for bucketing (a discrete decision - only the filter
+    coefficients blend across levels). With interp=False, lo == hi == near
+    and t == 0, i.e. hard nearest-level selection. Levels may be unsorted.
+    """
+    arr = np.asarray(levels, dtype=np.float64)
+    order = np.argsort(arr)              # ascending, maps to original indices
+    sarr = arr[order]
+    near = int(order[int(np.argmin(np.abs(sarr - sigma)))])
+    if not interp or arr.size == 1:
+        return near, near, 0.0, near
+    if sigma <= sarr[0]:
+        lo = hi = int(order[0])
+        return lo, hi, 0.0, near
+    if sigma >= sarr[-1]:
+        lo = hi = int(order[-1])
+        return lo, hi, 0.0, near
+    k = int(np.searchsorted(sarr, sigma))
+    lo = int(order[k - 1])
+    hi = int(order[k])
+    t = float((sigma - sarr[k - 1]) / (sarr[k] - sarr[k - 1]))
+    return lo, hi, t, near
 
 # ---------------------------------------------------------------------------
 # I/O helpers
@@ -74,27 +200,29 @@ def load_gray_float(path):
 # ---------------------------------------------------------------------------
 # Core inference
 # ---------------------------------------------------------------------------
-def denoise(noisy, model, blend_width=0.0, blend_flat=False):
+def denoise(noisy, model, blend_width=0.0, blend_flat=False,
+            h_filters=None, strength_thresholds=None,
+            coherence_thresholds=None, nlm_h=None, guide_sigma=None):
     """Apply RAISR denoising filters to a float64 grayscale image.
 
     Parameters
     ----------
     noisy : ndarray, shape (H, W), float64
     model : dict loaded from filter pickle
+    h_filters / strength_thresholds / coherence_thresholds / nlm_h /
+        guide_sigma : optional overrides for multi-noise models. Callers pick
+        (or blend) the noise-level bank first and inject the level's values
+        here; when omitted the model's own (first-level) values are used.
 
     Returns
     -------
     denoised : ndarray, shape (H, W), float64  (unclipped)
     """
-    h_filters = model["h"]           # (24,3,3, 121)
+
     Qangle     = model["Qangle"]
-    hash_mode  = model.get("hash_mode", "noisy")
-    guide_sigma = model.get("guide_sigma") or 0.8
-    nlm_h       = model.get("nlm_h") or 0.8 * model.get("sigma", 25.0)
-    # Use the thresholds the model was trained with; fall back to SR defaults
-    # only for legacy models that predate calibration.
-    strength_thresholds  = tuple(model.get("strength_thresholds",  (0.0001, 0.001)))
-    coherence_thresholds = tuple(model.get("coherence_thresholds", (0.25, 0.5)))
+    hash_mode  = model["hash_mode"]
+    strength_thresholds  = tuple(strength_thresholds)
+    coherence_thresholds = tuple(coherence_thresholds)
 
     patchsize  = model["patchsize"]
     gradsize   = model["gradientsize"]
@@ -265,11 +393,15 @@ def main():
     if model.get("task") != "denoise":
         raise ValueError("Model was not trained for denoising (task != 'denoise')")
 
-    print(f"  sigma={model['sigma']}, hash_mode={model.get('hash_mode','noisy')}, "
+    qnoise = model["Qnoise"]
+    levels = model["noise_levels"]
+    print(f"  noise levels={','.join(f'{s:g}' for s in levels)} "
+          f"hash_mode={model['hash_mode']}, "
           f"patchsize={model['patchsize']}")
-    if model.get("hash_mode") == "nlm" and model.get("nlm_backend") != "skimage-float":
-        print("  [WARN] model was trained with the old quantised NLM guide; "
-              "the hash source will differ at inference. Retrain recommended.")
+
+    # Noise-level selection mode
+    if args.sigma is None and not args.blind:
+        raise SystemExit("pass --sigma (known noise level) or --blind (estimate it)")
 
     # Load noisy input. For a regular image also keep the original Cr/Cb
     # channels so the denoised Y can be recombined into a color output that
@@ -300,11 +432,48 @@ def main():
         crcb = ycrcb[:, :, 1:3].copy()   # (H, W, 2) uint8: Cr, Cb
         H, W = noisy.shape
 
-        # Load clean reference if provided
-        
+        # --- pick the noise-level bank for this image ---
+        if args.blind:
+            sigma_sel = estimate_sigma_robust(noisy)
+            sigma_mad = estimate_sigma_mad(noisy)
+            sigma_imm = estimate_sigma_immerkaer(noisy)
+            print(f"  sigma_hat: robust={sigma_sel:.2f}  mad={sigma_mad:.2f}  "
+                  f"immerkaer={sigma_imm:.2f}  rail_frac="
+                  f"{clip_rail_fraction(noisy) * 100.0:.2f}%")
+        else:
+            sigma_sel = args.sigma
+
+        lo, hi, t, near = resolve_noise_bank(levels, sigma_sel,
+                                             interp=args.interp_noise)
+        nlm_by = model.get("nlm_h_by_level", [default_nlm_h(s) for s in levels])
+        gs_by  = model.get("guide_sigma_by_level",[default_guide_sigma(s) for s in levels])
+        if hi != lo and t > 0.0:
+            h_bank = ((1.0 - t) * model["h"][lo] + t * model["h"][hi])
+            # Guide strengths follow the same blend as the filter bank; under
+            # the default scaling rules this is exactly 0.8*sigma_sel (nlm) and
+            # 0.8*sigma_sel/25 (gaussian), i.e. continuous in sigma.
+            nlm_h_sel      = (1.0 - t) * nlm_by[lo] + t * nlm_by[hi]
+            guide_sigma_sel = (1.0 - t) * gs_by[lo]  + t * gs_by[hi]
+            blend_msg = f"interp {levels[lo]:g}->{levels[hi]:g} t={t:.2f}"
+        else:
+            # Hard selection uses the bank's trained values so the hash source
+            # matches training exactly.
+            h_bank = model["h"][near]
+            nlm_h_sel      = nlm_by[near] if nlm_by is not None else default_nlm_h(levels[near])
+            guide_sigma_sel = gs_by[near] if gs_by is not None else default_guide_sigma(levels[near])
+            blend_msg = f"bank {near} (sigma={levels[near]:g})"
+        s_thr = model["strength_thresholds_by_level"][near]
+        c_thr = model["coherence_thresholds_by_level"][near]
+        print(f"  noise select: sigma={sigma_sel:.2f} -> {blend_msg}")
+
         denoised = denoise(noisy, model,
                         blend_width=args.blend_width,
-                        blend_flat=args.share_flat)
+                        blend_flat=args.share_flat,
+                        h_filters=h_bank,
+                        strength_thresholds=s_thr,
+                        coherence_thresholds=c_thr,
+                        nlm_h=nlm_h_sel,
+                        guide_sigma=guide_sigma_sel)
 
         # Determine output path
         out_path = args.output + '/' + os.path.splitext(os.path.basename(image))[0] + '_result.png'
@@ -321,6 +490,7 @@ def main():
             cv2.imwrite(out_path, uint8)
 
         # Metrics
+        clean_ref = None
         if clean:
             clean_ref = load_gray_float(clean[imagecount - 1])
             if clean_ref.shape != noisy.shape:
@@ -344,9 +514,9 @@ def main():
                 titles = ["Clean", "Noisy", "Denoised", "Absolute error"]
             else:
                 guide = make_guide(noisy,
-                                   model.get("hash_mode", "noisy"),
-                                   model.get("guide_sigma") or 0.8,
-                                   model.get("nlm_h") or 0.8 * model.get("sigma", 25.0))
+                                   model["hash_mode"],
+                                   guide_sigma_sel,
+                                   nlm_h_sel)
                 residual = noisy - denoised.clip(0, 1)
                 imgs   = [noisy, guide, denoised.clip(0,1), residual]
                 titles = ["Noisy", "Guide", "Denoised", "Noisy - Denoised (residual)"]

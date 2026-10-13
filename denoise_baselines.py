@@ -19,20 +19,15 @@ import numpy as np
 
 from train_denoise import PATCHSIZE
 
-NOISY_DIR     = os.path.join("p0_samples", "noisy")
-BILATERAL_DIR = os.path.join("p0_samples", "bilateral")
-NLM_DIR       = os.path.join("p0_samples", "nlm")
+DIR     = "D:\\raisr\\p0_samples"
 IMG_EXTS      = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
-
 
 def get_args():
     p = argparse.ArgumentParser(description="Bilateral / NLM baseline denoising")
     p.add_argument("--sigma", type=float, default=25.0,
                    help="Noise sigma in [0,255] scale, used to set filter "
                         "strengths (default 25).")
-    p.add_argument("--input-dir",     default=NOISY_DIR)
-    p.add_argument("--bilateral-dir", default=BILATERAL_DIR)
-    p.add_argument("--nlm-dir",       default=NLM_DIR)
+    p.add_argument("--input-noisy",     default="noisy_25")
     return p.parse_args()
 
 
@@ -45,8 +40,8 @@ def bilateral_y(y_u8, sigma_noise):
     sigmaSpace  : spatial extent, matched to d
     """
     d = PATCHSIZE
-    sigma_color = float(2.5 * sigma_noise)   # [0,255] scale
-    sigma_space = float(d)
+    sigma_color = float(1.1 * sigma_noise)   # [0,255] scale
+    sigma_space = sigma_color
     return cv2.bilateralFilter(y_u8, d, sigma_color, sigma_space)
 
 
@@ -85,22 +80,27 @@ def process_one(path, sigma, bilat_dir, nlm_dir):
 
 def main():
     args = get_args()
-    os.makedirs(args.bilateral_dir, exist_ok=True)
-    os.makedirs(args.nlm_dir, exist_ok=True)
+    input_dir = os.path.join(DIR, "noisy/"+args.input_noisy)
+    bilateral_dir = os.path.join(DIR, "bilateral/"+args.input_noisy)
+    nlm_dir       = os.path.join(DIR, "nlm/"+args.input_noisy)
 
-    files = sorted(f for f in os.listdir(args.input_dir)
+    os.makedirs(bilateral_dir, exist_ok=True)
+    os.makedirs(nlm_dir, exist_ok=True)
+
+    files = sorted(f for f in os.listdir(input_dir)
                    if f.lower().endswith(IMG_EXTS))
     if not files:
-        print(f"No images found in {args.input_dir}")
+        print(f"No images found in {input_dir}")
         return
 
     print(f"Denoising {len(files)} images (sigma={args.sigma})")
-    print(f"  bilateral -> {args.bilateral_dir}")
-    print(f"  NLM       -> {args.nlm_dir}")
+    print(f"  input     -> {input_dir}")
+    print(f"  bilateral -> {bilateral_dir}")
+    print(f"  NLM       -> {nlm_dir}")
     for i, fn in enumerate(files, 1):
-        path = os.path.join(args.input_dir, fn)
+        path = os.path.join(input_dir, fn)
         print(f"  [{i}/{len(files)}] {fn}")
-        process_one(path, args.sigma, args.bilateral_dir, args.nlm_dir)
+        process_one(path, args.sigma, bilateral_dir, nlm_dir)
     print("Done.")
 
 

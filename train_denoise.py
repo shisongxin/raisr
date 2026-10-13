@@ -39,13 +39,27 @@ NLM_TEMPLATE_WIN = 5              # small local template
 NLM_SEARCH_WIN   = PATCHSIZE     # local search only (7) - cheap, light smoothing
 NLM_RADIUS       = NLM_SEARCH_WIN // 2   # 3
 
+# Per-level guide strength convention. The hash source is pre-smoothed just
+# enough that the structure tensor sees signal rather than noise, so the right
+# amount grows with the noise level. Both guides scale with sigma:
+#   nlm_h       = 0.8 x sigma          (8-bit gray-level units)
+#   guide_sigma = 0.8 x sigma / 25     (pixels; 0.8 px is the fidelity-matched
+#                                       gaussian at the sigma=25 anchor, where
+#                                       nlm_h = 20)
+GUIDE_SIGMA_REF = 25.0
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 def get_args():
     p = argparse.ArgumentParser(description="Train RAISR denoising filters")
-    p.add_argument("--sigma",             type=float, default=25.0,
-                   help="Noise standard deviation in [0,255] scale (default 25)")
+    p.add_argument("--noise-levels",      default="25",
+                   help="Comma-separated noise sigmas in [0,255] scale, e.g. "
+                        "'15,25,50'. Each level gets its own bank of %d "
+                        "buckets (thresholds and guide strength calibrated "
+                        "per level). A single value such as '25' trains a "
+                        "one-level bank - the degenerate case of the same "
+                        "multi-noise path." % N_FILTERS)
     p.add_argument("--max-images",        type=int,   default=0,
                    help="Maximum training images to use (0 = all)")
     p.add_argument("--samples-per-image", type=int,   default=50000,
@@ -55,12 +69,17 @@ def get_args():
                         "before hashing: 'nlm' (default) applies a light "
                         "non-local-means denoise (see --nlm-h); 'gaussian' "
                         "applies a small Gaussian smooth (see --guide-sigma).")
-    p.add_argument("--guide-sigma",       type=float, default=0.8,
-                   help="Gaussian sigma for --hash-mode gaussian pre-smoothing (pixels)")
+    p.add_argument("--guide-sigma",       type=float, default=None,
+                   help="Gaussian sigma (pixels) for --hash-mode gaussian "
+                        "pre-smoothing. Default: per level, 0.8 x sigma / %g "
+                        "so the guide fidelity follows the noise level the "
+                        "same way --nlm-h does. An explicit value overrides "
+                        "the rule for every level." % GUIDE_SIGMA_REF)
     p.add_argument("--nlm-h",             type=float, default=None,
                    help="NLM filter strength h for --hash-mode nlm, in 8-bit "
-                        "gray-level units (default: 0.8 x --sigma; matched to "
-                        "the --guide-sigma 0.8 gaussian guide fidelity)")
+                        "gray-level units. Default: per level, 0.8 x sigma "
+                        "(the fidelity match of the default gaussian guide). "
+                        "An explicit value overrides the rule for every level.")
     p.add_argument("--regularization",    type=float, default=1e-4,
                    help="Ridge regularization coefficient for cgls solver")
     p.add_argument("--adaptive-reg",     action="store_true",
@@ -106,7 +125,7 @@ def get_args():
     p.add_argument("--sample-strong-thresh", type=float, default=90.0,
                    help="Percentile of gradient magnitude above which pixels "
                         "are classified as 'strong structure' (default 90).")
-    p.add_argument("--output-dir",        default="runs/denoise_sigma25",
+    p.add_argument("--output-dir",        default="runs/denoise_test",
                    help="Directory to save model and statistics")
     p.add_argument("-q", "--qmatrix",     default=None,
                    help="Resume: path to existing Q statistics file")
@@ -172,16 +191,30 @@ def make_nlm_guide(noisy, h):
                             h=h / 255.0, fast_mode=True)
 
 
-def make_guide(noisy, hash_mode, guide_sigma=0.8, nlm_h=None):
+def default_nlm_h(sigma):
+    """Default NLM guide strength for a noise level (8-bit gray-level units)."""
+    return 0.8 * sigma
+
+
+def default_guide_sigma(sigma):
+    """Default Gaussian guide sigma (pixels) for a noise level."""
+    return 0.8 * sigma / GUIDE_SIGMA_REF
+
+
+def make_guide(noisy, hash_mode, guide_sigma=None, nlm_h=None):
     """Return the hash source after the requested lightweight preprocessing.
 
     'gaussian'/'guided': light Gaussian smooth (sigma from --guide-sigma).
     'nlm':               light non-local-means denoise (strength from --nlm-h).
+
+    Both strengths are resolved per noise level (see default_guide_sigma /
+    default_nlm_h); pass the level's values here so the hash source matches
+    what calibration saw.
     """
-    if hash_mode in ("gaussian", "guided"):
-        return gaussian_filter(noisy, sigma=guide_sigma, mode='reflect')
+    if hash_mode == "gaussian":
+        return gaussian_filter(noisy, guide_sigma if guide_sigma else default_guide_sigma(GUIDE_SIGMA_REF), mode='reflect')
     if hash_mode == "nlm":
-        return make_nlm_guide(noisy, nlm_h if nlm_h is not None else 20.0)
+        return make_nlm_guide(noisy, nlm_h if nlm_h is not None else default_nlm_h(GUIDE_SIGMA_REF))
     return noisy
 
 
@@ -194,8 +227,13 @@ def _lamda_of(block, W):
     return float(w.max())
 
 
-def _sample_real_lamda_and_u(imagelist, weighting, sigma_f, args):
-    """Sample lambda and u from real noisy training images."""
+def _sample_real_lamda_and_u(imagelist, weighting, sigma_f, args,
+                             guide_sigma, nlm_h):
+    """Sample lambda and u from real noisy training images.
+
+    `guide_sigma` / `nlm_h` are this noise level's guide strengths, so the
+    hash source is exactly what training will use for the level.
+    """
     calib_paths = imagelist[:min(args.calib_images, len(imagelist))]
     lamdas, us = [], []
     for idx, path in enumerate(calib_paths):
@@ -206,7 +244,7 @@ def _sample_real_lamda_and_u(imagelist, weighting, sigma_f, args):
         except IOError:
             continue
         noisy = clean + rng.normal(0.0, sigma_f, size=clean.shape)
-        hash_src = make_guide(noisy, args.hash_mode, args.guide_sigma, args.nlm_h)
+        hash_src = make_guide(noisy, args.hash_mode, guide_sigma, nlm_h)
         hash_pad = reflect_pad(hash_src, GRADMARGIN)
         H, W = clean.shape
         n = min(args.calib_samples, H * W)
@@ -224,7 +262,7 @@ def _sample_real_lamda_and_u(imagelist, weighting, sigma_f, args):
             l1 = np.sqrt(max(w[0], 0.0)); l2 = np.sqrt(max(w[1], 0.0))
             us.append((l1 - l2) / (l1 + l2) if (l1 + l2) > 0 else 0.0)
         print_progress(idx, len(calib_paths))
-    print()
+    end_status()
     return np.array(lamdas), np.array(us)
 
 
@@ -232,7 +270,7 @@ FLAT_GRAD_THRESH = 2.0 / 255.0   # clean |grad| below this = locally flat
 
 
 def _sample_real_flat_lamda(imagelist, weighting, sigma_f, args,
-                            n_per_image=2000):
+                            guide_sigma, nlm_h, n_per_image=2000):
     """Lambda of genuinely flat clean regions after the hash preprocessing.
 
     This is the physical noise floor: where the clean image is locally flat the
@@ -241,6 +279,8 @@ def _sample_real_flat_lamda(imagelist, weighting, sigma_f, args,
     (instead of synthetic pure-noise patches) keeps the floor consistent with
     content-dependent preprocessing such as NLM, which denoises a structureless
     patch far more aggressively than a real flat region.
+
+    `guide_sigma` / `nlm_h` are this noise level's guide strengths.
     """
     calib_paths = imagelist[:min(args.calib_images, len(imagelist))]
     lamdas = []
@@ -252,7 +292,7 @@ def _sample_real_flat_lamda(imagelist, weighting, sigma_f, args,
         except IOError:
             continue
         noisy = clean + rng.normal(0.0, sigma_f, size=clean.shape)
-        hash_src = make_guide(noisy, args.hash_mode, args.guide_sigma, args.nlm_h)
+        hash_src = make_guide(noisy, args.hash_mode, guide_sigma, nlm_h)
         hash_pad = reflect_pad(hash_src, GRADMARGIN)
         # Flatness is judged on the CLEAN image so noise cannot make a flat
         # region look structured (or vice versa).
@@ -270,11 +310,12 @@ def _sample_real_flat_lamda(imagelist, weighting, sigma_f, args,
                              cg - GRADMARGIN: cg + GRADMARGIN + 1]
             lamdas.append(_lamda_of(block, weighting))
         print_progress(idx, len(calib_paths))
-    print()
+    end_status()
     return np.array(lamdas)
 
 
-def _estimate_noise_floor(weighting, sigma_f, args, n_mc=100000):
+def _estimate_noise_floor(weighting, sigma_f, args, guide_sigma, nlm_h,
+                          n_mc=100000):
     """Synthetic fallback: lambda of pure AWGN on a flat patch.
 
     Only used when too few flat regions are found in the calibration images
@@ -288,12 +329,13 @@ def _estimate_noise_floor(weighting, sigma_f, args, n_mc=100000):
     size = GRADSIZE + 2 * pad
     for i in range(n_mc):
         patch = rng.normal(0.0, sigma_f, size=(size, size))
-        guide = make_guide(patch, args.hash_mode, args.guide_sigma, args.nlm_h)
+        guide = make_guide(patch, args.hash_mode, guide_sigma, nlm_h)
         lamdas[i] = _lamda_of(guide[pad:pad + GRADSIZE, pad:pad + GRADSIZE], weighting)
     return lamdas
 
 
-def calibrate_strength_thresholds(imagelist, weighting, sigma_f, args):
+def calibrate_strength_thresholds(imagelist, weighting, sigma_f, args,
+                                  guide_sigma, nlm_h):
     """Return (low, high) strength thresholds and (low, high) coherence thresholds.
 
     Strength: noise-floor anchored (default) or equal-quantile.
@@ -302,22 +344,26 @@ def calibrate_strength_thresholds(imagelist, weighting, sigma_f, args):
                bucket 0 = low direction reliability, 1 = moderate, 2 = strong.
 
     Returns (strength_thresholds, coherence_thresholds) as two (low, high) tuples.
+    `guide_sigma` / `nlm_h` select this noise level's guide strength.
     """
     print(f"Calibrating thresholds on "
           f"{min(args.calib_images, len(imagelist))} images "
           f"(method={args.calib_method}) ...")
-    real_l, real_u = _sample_real_lamda_and_u(imagelist, weighting, sigma_f, args)
+    real_l, real_u = _sample_real_lamda_and_u(imagelist, weighting, sigma_f, args,
+                                              guide_sigma, nlm_h)
 
     # --- strength ---
     if args.calib_method == "quantile":
         s_low  = float(np.percentile(real_l, 100.0 / 3.0))
         s_high = float(np.percentile(real_l, 200.0 / 3.0))
     else:  # noise-floor
-        floor = _sample_real_flat_lamda(imagelist, weighting, sigma_f, args)
+        floor = _sample_real_flat_lamda(imagelist, weighting, sigma_f, args,
+                                        guide_sigma, nlm_h)
         if floor.size < 100:
             print(f"  [WARN] only {floor.size} flat-region samples; "
                   f"falling back to synthetic noise floor")
-            floor = _estimate_noise_floor(weighting, sigma_f, args)
+            floor = _estimate_noise_floor(weighting, sigma_f, args,
+                                          guide_sigma, nlm_h)
         s_low = float(np.percentile(floor, args.calib_low_pct))
         signal_l = real_l[real_l > s_low]
         s_high = float(np.percentile(signal_l, args.calib_high_pct)) \
@@ -355,12 +401,37 @@ def calibrate_strength_thresholds(imagelist, weighting, sigma_f, args):
     return (s_low, s_high), (c_low, c_high)
 
 
-def print_progress(done, total):
-    print('\r|', end='')
-    print('#' * round((done+1)*100/total/2), end='')
-    print(' ' * (50 - round((done+1)*100/total/2)), end='')
-    print('|  ' + str(round((done+1)*100/total)) + '%', end='')
+_status_len = 0
+
+
+def print_status(text):
+    """Refresh the one-line status display in place (no scrollback growth).
+
+    The line is padded up to the previous width so shorter messages do not
+    leave residue behind. Use end_status() before any normal print().
+    """
+    global _status_len
+    text = str(text)
+    sys.stdout.write('\r' + text + ' ' * max(0, _status_len - len(text)))
     sys.stdout.flush()
+    _status_len = len(text)
+
+
+def end_status():
+    """Terminate the status line so normal print() output starts on a new line."""
+    global _status_len
+    if _status_len:
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+        _status_len = 0
+
+
+def print_progress(done, total, prefix=""):
+    """Refresh the status line with the progress bar, optionally after `prefix`."""
+    frac = round((done + 1) * 100 / total / 2)
+    bar = ('|' + '#' * frac + ' ' * (50 - frac) + '|  '
+           + str(round((done + 1) * 100 / total)) + '%')
+    print_status(f'{prefix}  {bar}' if prefix else bar)
 
 
 # ---------------------------------------------------------------------------
@@ -369,12 +440,17 @@ def print_progress(done, total):
 def accumulate(noisy_pad, hash_pad, clean_orig,
                center_rows, center_cols,
                Q, V, counts,
-               weighting, strength_thresholds, coherence_thresholds):
-    """Accumulate Q, V, counts for the selected center positions."""
+               weighting, strength_thresholds, coherence_thresholds,
+               noise_idx=0, status_prefix=""):
+    """Accumulate Q, V, counts for the selected center positions.
+
+    Q/V/counts carry a leading noise-level dimension; `noise_idx` selects the
+    level's slice.
+    """
     n_pos = len(center_rows)
     for i, (row, col) in enumerate(zip(center_rows, center_cols)):
         if i%1000==0:
-            print_progress(i, n_pos)
+            print_progress(i, n_pos, prefix=status_prefix)
 
         # patch from noisy (padded)
         r_p = row + PATCHMARGIN   # index into padded array
@@ -396,9 +472,9 @@ def accumulate(noisy_pad, hash_pad, clean_orig,
         label = clean_orig[row, col]
 
         x = patch
-        Q[angle, strength, coherence] += np.outer(x, x)
-        V[angle, strength, coherence] += x * label
-        counts[angle, strength, coherence] += 1
+        Q[noise_idx, angle, strength, coherence] += np.outer(x, x)
+        V[noise_idx, angle, strength, coherence] += x * label
+        counts[noise_idx, angle, strength, coherence] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -463,27 +539,33 @@ def augment_statistics(Q_orig, V_orig, counts_orig):
 
     The original (identity) transform is included, so the result is 8× the
     original counts. Q_orig / V_orig are NOT modified.
+
+    Arrays carry a leading noise-level dimension (qnoise, 24, 3, 3, ...); the
+    geometric remaps are noise-independent, so each level is augmented by the
+    same (a,s,c) -> (a2,s,c) rules.
     """
     Q_aug = Q_orig.copy()
     V_aug = V_orig.copy()
     counts_aug = counts_orig.copy()
+    qnoise = counts_orig.shape[0]
 
-    for perm, angle_remap in zip(_PERMS, _ANGLE_REMAPS):
-        for a in range(QANGLE):
-            a2 = angle_remap(a)
-            for s in range(QSTRENGTH):
-                for c in range(QCOHERENCE):
-                    Q_src = Q_orig[a, s, c]
-                    V_src = V_orig[a, s, c]
-                    cnt   = counts_orig[a, s, c]
-                    if cnt == 0:
-                        continue
-                    # Permute rows and columns of Q, elements of V
-                    Q_t = Q_src[np.ix_(perm, perm)]
-                    V_t = V_src[perm]
-                    Q_aug[a2, s, c] += Q_t
-                    V_aug[a2, s, c] += V_t
-                    counts_aug[a2, s, c] += cnt
+    for n in range(qnoise):
+        for perm, angle_remap in zip(_PERMS, _ANGLE_REMAPS):
+            for a in range(QANGLE):
+                a2 = angle_remap(a)
+                for s in range(QSTRENGTH):
+                    for c in range(QCOHERENCE):
+                        Q_src = Q_orig[n, a, s, c]
+                        V_src = V_orig[n, a, s, c]
+                        cnt   = counts_orig[n, a, s, c]
+                        if cnt == 0:
+                            continue
+                        # Permute rows and columns of Q, elements of V
+                        Q_t = Q_src[np.ix_(perm, perm)]
+                        V_t = V_src[perm]
+                        Q_aug[n, a2, s, c] += Q_t
+                        V_aug[n, a2, s, c] += V_t
+                        counts_aug[n, a2, s, c] += cnt
 
     return Q_aug, V_aug, counts_aug
 
@@ -509,39 +591,48 @@ def check_filters(h):
 # Solve all buckets
 # ---------------------------------------------------------------------------
 def solve_filters(Q, V, counts, regularization, adaptive_reg=False):
+    """Solve one filter per bucket for every noise level.
+
+    Q/V/counts carry a leading noise-level dimension. Returns
+    (h, empty_by_level) with h shaped (qnoise, QANGLE, QSTRENGTH, QCOHERENCE,
+    PATCH_AREA) and empty_by_level a list of per-level fallback counts.
+    """
     h0 = np.zeros(PATCH_AREA)
     h0[PATCH_AREA // 2] = 1.0
 
-    h = np.zeros((QANGLE, QSTRENGTH, QCOHERENCE, PATCH_AREA))
-    empty_buckets = 0
+    qnoise = counts.shape[0]
+    h = np.zeros((qnoise, QANGLE, QSTRENGTH, QCOHERENCE, PATCH_AREA))
+    empty_by_level = []
 
-    if adaptive_reg:
-        nonzero = counts[counts > 0]
-        median_cnt = float(np.median(nonzero)) if nonzero.size > 0 else 1.0
-
-    total = QANGLE * QSTRENGTH * QCOHERENCE
+    total = qnoise * QANGLE * QSTRENGTH * QCOHERENCE
     done = 0
-    for a in range(QANGLE):
-        for s in range(QSTRENGTH):
-            for c in range(QCOHERENCE):
-                print_progress(done, total)
-                done += 1
-                if counts[a, s, c] == 0:
-                    h[a, s, c] = h0
-                    empty_buckets += 1
-                    continue
-                reg = regularization
-                if adaptive_reg:
-                    factor = np.sqrt(median_cnt / float(counts[a, s, c]))
-                    factor = np.clip(factor, 0.25, 4.0)
-                    reg = regularization * factor
-                try:
-                    h[a, s, c] = cgls(Q[a, s, c], V[a, s, c], reg)
-                except Exception:
-                    h[a, s, c] = h0
-                    empty_buckets += 1
-    print()
-    return h, empty_buckets
+    for n in range(qnoise):
+        empty_buckets = 0
+        if adaptive_reg:
+            nonzero = counts[n][counts[n] > 0]
+            median_cnt = float(np.median(nonzero)) if nonzero.size > 0 else 1.0
+        for a in range(QANGLE):
+            for s in range(QSTRENGTH):
+                for c in range(QCOHERENCE):
+                    print_progress(done, total)
+                    done += 1
+                    if counts[n, a, s, c] == 0:
+                        h[n, a, s, c] = h0
+                        empty_buckets += 1
+                        continue
+                    reg = regularization
+                    if adaptive_reg:
+                        factor = np.sqrt(median_cnt / float(counts[n, a, s, c]))
+                        factor = np.clip(factor, 0.25, 4.0)
+                        reg = regularization * factor
+                    try:
+                        h[n, a, s, c] = cgls(Q[n, a, s, c], V[n, a, s, c], reg)
+                    except Exception:
+                        h[n, a, s, c] = h0
+                        empty_buckets += 1
+        empty_by_level.append(empty_buckets)
+    end_status()
+    return h, empty_by_level
 
 
 # ---------------------------------------------------------------------------
@@ -550,19 +641,41 @@ def solve_filters(Q, V, counts, regularization, adaptive_reg=False):
 def main():
     args = get_args()
 
-    # Resolve the NLM strength default now so the resolved value flows into
-    # calibration, metadata and the header print (sigma is in [0,255] scale).
-    if args.nlm_h is None:
-        args.nlm_h = float(0.8 * args.sigma)
+    # --- noise levels ---
+    noise_levels = [float(x) for x in args.noise_levels.split(",") if x.strip()]
+    if not noise_levels:
+        raise SystemExit("--noise-levels must list at least one sigma")
+    if any(s <= 0 for s in noise_levels):
+        raise SystemExit("--noise-levels entries must be positive")
+    qnoise = len(noise_levels)
 
-    sigma_f = args.sigma / 255.0
+    # Per-level guide strength. An explicit --guide-sigma / --nlm-h overrides
+    # the scaling rule for every level; otherwise each level's guide follows
+    # its own sigma (default_guide_sigma / default_nlm_h).
+    guide_sigma_by_level = [None] * qnoise
+    nlm_h_by_level = [None] * qnoise
+    if args.hash_mode == "gaussian":
+        if args.guide_sigma is not None:
+            print(f"[NOTE] --guide-sigma {args.guide_sigma:g} overrides the "
+                  f"per-level scaling rule for every noise level")
+            guide_sigma_by_level = [float(args.guide_sigma)] * qnoise
+        else:
+            guide_sigma_by_level = [default_guide_sigma(s) for s in noise_levels]
+    elif args.hash_mode == "nlm":
+        if args.nlm_h is not None:
+            print(f"[NOTE] --nlm-h {args.nlm_h:g} overrides the 0.8 x sigma "
+                  f"rule for every noise level")
+            nlm_h_by_level = [float(args.nlm_h)] * qnoise
+        else:
+            nlm_h_by_level = [default_nlm_h(s) for s in noise_levels]
+
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Weighting matrix for structure tensor (same convention as train.py)
     weighting = gaussian2d([GRADSIZE, GRADSIZE], 2)
     weighting = np.diag(weighting.ravel())
 
-    # Load training image list from split manifest if present, else scan trainpath
+    # Load training image list from trainpath
     imagelist = []
     for parent, _, filenames in os.walk("train"):
         for fn in filenames:
@@ -575,56 +688,111 @@ def main():
 
     n_images = len(imagelist)
     print(f"Training images : {n_images}")
-    print(f"sigma           : {args.sigma} ({sigma_f:.5f} in float)")
-    detail = (f"  guide_sigma={args.guide_sigma}" if args.hash_mode == "gaussian"
-              else (f"  nlm_h={args.nlm_h}" if args.hash_mode == "nlm" else ""))
+    print(f"noise levels    : {', '.join(f'{s:g}' for s in noise_levels)} "
+          f"({qnoise} level{'s' if qnoise != 1 else ''})")
+    if args.hash_mode == "gaussian":
+        detail = ("  guide_sigma=" + ", ".join(f'{s:.3f}' for s in guide_sigma_by_level))
+    elif args.hash_mode == "nlm":
+        detail = ("  nlm_h=" + ", ".join(f'{h:g}' for h in nlm_h_by_level))
+    else:
+        detail = ""
     print(f"hash mode       : {args.hash_mode}{detail}")
     print(f"samples/image   : {args.samples_per_image or 'all'}")
     print(f"output dir      : {args.output_dir}")
 
-    # Resume: load existing Q/V or allocate fresh
-    Q = np.zeros((QANGLE, QSTRENGTH, QCOHERENCE, PATCH_AREA, PATCH_AREA), dtype=np.float64)
-    V = np.zeros((QANGLE, QSTRENGTH, QCOHERENCE, PATCH_AREA),             dtype=np.float64)
-    counts = np.zeros((QANGLE, QSTRENGTH, QCOHERENCE),                    dtype=np.int64)
+    # Resume: load existing Q/V or allocate fresh.
+    # Leading axis is the noise level (qnoise); legacy single-noise stats files
+    # predate that axis and are promoted with a length-1 leading dimension.
+    Q = np.zeros((qnoise, QANGLE, QSTRENGTH, QCOHERENCE, PATCH_AREA, PATCH_AREA), dtype=np.float64)
+    V = np.zeros((qnoise, QANGLE, QSTRENGTH, QCOHERENCE, PATCH_AREA),              dtype=np.float64)
+    counts = np.zeros((qnoise, QANGLE, QSTRENGTH, QCOHERENCE),                     dtype=np.int64)
 
     completed_images = set()
+    qdata = None
     if args.qmatrix and args.vmatrix:
+        missing = [p for p in (args.qmatrix, args.vmatrix) if not os.path.isfile(p)]
+        if missing:
+            raise SystemExit(
+                f"[ERROR] -q/-v are resume inputs, but not found: {missing}. "
+                f"Drop them to start a fresh run.")
         print("Resuming from existing Q/V ...")
         with open(args.qmatrix, "rb") as f:
             qdata = pickle.load(f)
         with open(args.vmatrix, "rb") as f:
             vdata = pickle.load(f)
-        Q      = qdata["Q"]
-        V      = vdata["V"]
-        counts = qdata["counts"]
+
+        # Consistency: thresholds/buckets only make sense across images that
+        # share the same noise schedule and hash preprocessing. Previously this
+        # was printed but not enforced.
+        stored_levels = qdata.get("noise_levels")
+        if stored_levels is not None and \
+                [float(s) for s in stored_levels] != noise_levels:
+            raise SystemExit(
+                f"[ERROR] resume noise levels {stored_levels} do not match "
+                f"this run's {noise_levels}; use matching statistics.")
+        stored_hash_mode = qdata.get("hash_mode")
+        if stored_hash_mode is not None and stored_hash_mode != args.hash_mode:
+            raise SystemExit(
+                f"[ERROR] resume hash_mode={stored_hash_mode!r} does not match "
+                f"this run's {args.hash_mode!r}; use matching statistics.")
+
+        Q      = np.asarray(qdata["Q"])
+        V      = np.asarray(vdata["V"])
+        counts = np.asarray(qdata["counts"])
+        if counts.ndim == 3:
+            # legacy single-noise layout (24,3,3,...) -> (1,24,3,3,...)
+            Q = Q[np.newaxis]
+            V = V[np.newaxis]
+            counts = counts[np.newaxis]
+        if counts.shape[0] != qnoise:
+            raise SystemExit(
+                f"[ERROR] resume statistics cover {counts.shape[0]} noise "
+                f"level(s) but this run expects {qnoise}.")
         completed_images = set(qdata.get("completed_images", []))
         print(f"  Loaded {len(completed_images)} already-completed images.")
 
-    # Determine strength and coherence thresholds.
+    # Determine strength and coherence thresholds (per noise level).
     # On resume, reuse the thresholds stored with the statistics so that new
     # samples land in the same buckets as the ones already accumulated.
     SR_DEFAULT_STRENGTH   = (0.0001, 0.001)
     SR_DEFAULT_COHERENCE  = (0.25, 0.5)
-    resumed_s_thresh = None
-    resumed_c_thresh = None
-    if args.qmatrix and args.vmatrix:
-        resumed_s_thresh = qdata.get("strength_thresholds")
-        resumed_c_thresh = qdata.get("coherence_thresholds")
+    strength_thresholds_by_level  = []
+    coherence_thresholds_by_level = []
 
-    if resumed_s_thresh is not None:
-        strength_thresholds  = tuple(resumed_s_thresh)
-        coherence_thresholds = tuple(resumed_c_thresh) if resumed_c_thresh else SR_DEFAULT_COHERENCE
-        print(f"Reusing stored thresholds: "
-              f"strength=({strength_thresholds[0]:.6f}, {strength_thresholds[1]:.6f})  "
-              f"coherence=({coherence_thresholds[0]:.4f}, {coherence_thresholds[1]:.4f})")
+    if qdata is not None:
+        resumed_s_by_level = qdata.get("strength_thresholds_by_level")
+        resumed_c_by_level = qdata.get("coherence_thresholds_by_level")
+    else:
+        resumed_s_by_level = None
+        resumed_c_by_level = None
+
+    if resumed_s_by_level is not None:
+        strength_thresholds_by_level  = [tuple(t) for t in resumed_s_by_level]
+        coherence_thresholds_by_level = [
+            tuple(t) if t is not None else SR_DEFAULT_COHERENCE
+            for t in (resumed_c_by_level or [None] * qnoise)]
+        for n, (s_t, c_t) in enumerate(zip(strength_thresholds_by_level,
+                                           coherence_thresholds_by_level)):
+            print(f"  [level {n}] reusing stored thresholds: "
+                  f"strength=({s_t[0]:.6f}, {s_t[1]:.6f})  "
+                  f"coherence=({c_t[0]:.4f}, {c_t[1]:.4f})")
     elif args.no_calibrate:
-        strength_thresholds  = SR_DEFAULT_STRENGTH
-        coherence_thresholds = SR_DEFAULT_COHERENCE
+        strength_thresholds_by_level  = [SR_DEFAULT_STRENGTH]  * qnoise
+        coherence_thresholds_by_level = [SR_DEFAULT_COHERENCE] * qnoise
         print(f"Calibration disabled; using SR defaults: "
               f"strength={SR_DEFAULT_STRENGTH}  coherence={SR_DEFAULT_COHERENCE}")
     else:
-        strength_thresholds, coherence_thresholds = calibrate_strength_thresholds(
-            imagelist, weighting, sigma_f, args)
+        for n, sigma_n in enumerate(noise_levels):
+            if qnoise > 1:
+                guide_desc = (f"guide_sigma={guide_sigma_by_level[n]:.3f}"
+                              if guide_sigma_by_level[n] is not None
+                              else f"nlm_h={nlm_h_by_level[n]:g}")
+                print(f"--- level {n}: sigma={sigma_n:g} ({guide_desc}) ---")
+            s_t, c_t = calibrate_strength_thresholds(
+                imagelist, weighting, sigma_n / 255.0, args,
+                guide_sigma_by_level[n], nlm_h_by_level[n])
+            strength_thresholds_by_level.append(s_t)
+            coherence_thresholds_by_level.append(c_t)
 
     # Noise RNG base: per-image seeds are derived from the fixed list index
     # via SeedSequence spawn_key, so each image's noise is stable and depends
@@ -633,125 +801,142 @@ def main():
     noise_base_seed = 1234
 
     t_start = time.time()
-
     for img_idx, image_path in enumerate(imagelist):
-        print('\r', end='')
-        print(' ' * 60, end='')
-        print('\rProcessing image ' + str(img_idx+1) + ' of ' + str(n_images) + ' (' + image_path + ')')
+        status = f'Processing image {img_idx+1}/{n_images} ({image_path})'
 
         if image_path in completed_images:
-            print('  [skip] already accumulated')
+            print_status(status + '  [skip] already accumulated')
             continue
-
-        # Stable per-image noise seed derived from the fixed list index.
-        # spawn_key ties the seed to img_idx only, so resume/skip cannot shift it.
-        img_ss = np.random.SeedSequence(noise_base_seed, spawn_key=(img_idx,))
-        rng = np.random.default_rng(img_ss)
 
         try:
             clean = load_gray(image_path)
         except IOError as e:
+            end_status()
             print(f'  [WARN] {e}')
             continue
 
         H, W = clean.shape
 
-        # Add AWGN
-        noisy = clean + rng.normal(0.0, sigma_f, size=clean.shape)
+        for level_idx, sigma_n in enumerate(noise_levels):
+            level_status = (f'{status}  level {level_idx+1}/{qnoise} '
+                            f'sigma={sigma_n:g}')
+            print_status(level_status)
 
-        # Lightweight-preprocess the hash source (gaussian smoothing or NLM)
-        hash_src = make_guide(noisy, args.hash_mode, args.guide_sigma, args.nlm_h)
+            # Stable noise seed derived from the fixed image index and noise
+            # level, so each (image, level) pair's noise is independent of the
+            # others and immune to resume/skip order.
+            img_ss = np.random.SeedSequence(noise_base_seed,
+                                            spawn_key=(img_idx, level_idx))
+            rng = np.random.default_rng(img_ss)
 
-        # Reflect-pad both noisy (for patches) and hash source (for gradient blocks)
-        noisy_pad    = reflect_pad(noisy,    PATCHMARGIN)
-        hash_pad     = reflect_pad(hash_src, GRADMARGIN)
+            # Add AWGN
+            noisy = clean + rng.normal(0.0, sigma_n / 255.0, size=clean.shape)
 
-        # Select center positions
-        all_rows = np.arange(H)
-        all_cols = np.arange(W)
-        row_grid, col_grid = np.meshgrid(all_rows, all_cols, indexing='ij')
-        all_centers = np.stack([row_grid.ravel(), col_grid.ravel()], axis=1)
-        n_pix = len(all_centers)
+            # Lightweight-preprocess the hash source (gaussian smoothing or NLM)
+            # with this level's guide strength.
+            hash_src = make_guide(noisy, args.hash_mode,
+                                  guide_sigma_by_level[level_idx],
+                                  nlm_h_by_level[level_idx])
 
-        if args.samples_per_image > 0 and n_pix > args.samples_per_image:
-            n_total = args.samples_per_image
+            # Reflect-pad both noisy (for patches) and hash source (for gradient blocks)
+            noisy_pad    = reflect_pad(noisy,    PATCHMARGIN)
+            hash_pad     = reflect_pad(hash_src, GRADMARGIN)
 
-            if args.sample_strategy == "stratified":
-                # Classify pixels by structural content on the hash source
-                struct_labels, (g_lo, g_hi) = classify_pixels_by_structure(
-                    hash_src, args.sample_flat_thresh, args.sample_strong_thresh)
+            # Select center positions
+            all_rows = np.arange(H)
+            all_cols = np.arange(W)
+            row_grid, col_grid = np.meshgrid(all_rows, all_cols, indexing='ij')
+            all_centers = np.stack([row_grid.ravel(), col_grid.ravel()], axis=1)
+            n_pix = len(all_centers)
 
-                flat_idx   = np.where(struct_labels.ravel() == 0)[0]
-                mod_idx    = np.where(struct_labels.ravel() == 1)[0]
-                strong_idx = np.where(struct_labels.ravel() == 2)[0]
-                n_flat, n_mod, n_strong = len(flat_idx), len(mod_idx), len(strong_idx)
+            if args.samples_per_image > 0 and n_pix > args.samples_per_image:
+                n_total = args.samples_per_image
 
-                # Allocate sample budget
-                n_flat_budget   = int(n_total * args.sample_flat_ratio)
-                n_struct_budget = n_total - n_flat_budget
-                n_mod_budget    = int(n_struct_budget * n_mod / max(n_mod + n_strong, 1))
-                n_strong_budget = n_struct_budget - n_mod_budget
+                if args.sample_strategy == "stratified":
+                    # Classify pixels by structural content on the hash source
+                    struct_labels, (g_lo, g_hi) = classify_pixels_by_structure(
+                        hash_src, args.sample_flat_thresh, args.sample_strong_thresh)
 
-                # Cap at actual pixel counts
-                n_flat_samp   = min(n_flat_budget,   n_flat)
-                n_mod_samp    = min(n_mod_budget,    n_mod)
-                n_strong_samp = min(n_strong_budget, n_strong)
+                    flat_idx   = np.where(struct_labels.ravel() == 0)[0]
+                    mod_idx    = np.where(struct_labels.ravel() == 1)[0]
+                    strong_idx = np.where(struct_labels.ravel() == 2)[0]
+                    n_flat, n_mod, n_strong = len(flat_idx), len(mod_idx), len(strong_idx)
 
-                # Redistribute unused budget to other categories
-                unused = (n_flat_budget - n_flat_samp) + (n_mod_budget - n_mod_samp) + (n_strong_budget - n_strong_samp)
-                if unused > 0:
-                    # Give to categories that still have headroom
-                    for idx_arr, count, budget in [
-                        (flat_idx,   n_flat,   n_flat_budget),
-                        (mod_idx,    n_mod,    n_mod_budget),
-                        (strong_idx, n_strong, n_strong_budget),
-                    ]:
-                        extra = min(unused, len(idx_arr) - (count if count <= budget else budget))
-                        if idx_arr is flat_idx:
-                            n_flat_samp += extra
-                        elif idx_arr is mod_idx:
-                            n_mod_samp += extra
-                        else:
-                            n_strong_samp += extra
-                        unused -= extra
-                        if unused <= 0:
-                            break
+                    # Allocate sample budget
+                    n_flat_budget   = int(n_total * args.sample_flat_ratio)
+                    n_struct_budget = n_total - n_flat_budget
+                    n_mod_budget    = int(n_struct_budget * n_mod / max(n_mod + n_strong, 1))
+                    n_strong_budget = n_struct_budget - n_mod_budget
 
-                # Sample without replacement from each category
-                chosen_flat   = rng.choice(flat_idx,   size=n_flat_samp,   replace=False) if n_flat_samp   > 0 else np.array([], dtype=np.int64)
-                chosen_mod    = rng.choice(mod_idx,    size=n_mod_samp,    replace=False) if n_mod_samp    > 0 else np.array([], dtype=np.int64)
-                chosen_strong = rng.choice(strong_idx, size=n_strong_samp, replace=False) if n_strong_samp > 0 else np.array([], dtype=np.int64)
-                chosen = np.concatenate([chosen_flat, chosen_mod, chosen_strong])
-                rng.shuffle(chosen)
-                centers = all_centers[chosen]
+                    # Cap at actual pixel counts
+                    n_flat_samp   = min(n_flat_budget,   n_flat)
+                    n_mod_samp    = min(n_mod_budget,    n_mod)
+                    n_strong_samp = min(n_strong_budget, n_strong)
 
-                print(f"  stratified: flat={n_flat_samp} ({n_flat_samp*100/max(n_total,1):.0f}%)  "
-                      f"mod={n_mod_samp}  strong={n_strong_samp}  "
-                      f"(thresh: lo={g_lo:.4f}, hi={g_hi:.4f})")
+                    # Redistribute unused budget to other categories
+                    unused = (n_flat_budget - n_flat_samp) + (n_mod_budget - n_mod_samp) + (n_strong_budget - n_strong_samp)
+                    if unused > 0:
+                        # Give to categories that still have headroom
+                        for idx_arr, count, budget in [
+                            (flat_idx,   n_flat,   n_flat_budget),
+                            (mod_idx,    n_mod,    n_mod_budget),
+                            (strong_idx, n_strong, n_strong_budget),
+                        ]:
+                            extra = min(unused, len(idx_arr) - (count if count <= budget else budget))
+                            if idx_arr is flat_idx:
+                                n_flat_samp += extra
+                            elif idx_arr is mod_idx:
+                                n_mod_samp += extra
+                            else:
+                                n_strong_samp += extra
+                            unused -= extra
+                            if unused <= 0:
+                                break
+
+                    # Sample without replacement from each category
+                    chosen_flat   = rng.choice(flat_idx,   size=n_flat_samp,   replace=False) if n_flat_samp   > 0 else np.array([], dtype=np.int64)
+                    chosen_mod    = rng.choice(mod_idx,    size=n_mod_samp,    replace=False) if n_mod_samp    > 0 else np.array([], dtype=np.int64)
+                    chosen_strong = rng.choice(strong_idx, size=n_strong_samp, replace=False) if n_strong_samp > 0 else np.array([], dtype=np.int64)
+                    chosen = np.concatenate([chosen_flat, chosen_mod, chosen_strong])
+                    rng.shuffle(chosen)
+                    centers = all_centers[chosen]
+
+                    end_status()
+                    print(f"  stratified: flat={n_flat_samp} ({n_flat_samp*100/max(n_total,1):.0f}%)  "
+                          f"mod={n_mod_samp}  strong={n_strong_samp}  "
+                          f"(thresh: lo={g_lo:.4f}, hi={g_hi:.4f})")
+                else:
+                    chosen = rng.choice(n_pix, size=n_total, replace=False)
+                    centers = all_centers[chosen]
             else:
-                chosen = rng.choice(n_pix, size=n_total, replace=False)
-                centers = all_centers[chosen]
-        else:
-            centers = all_centers
+                centers = all_centers
 
-        center_rows = centers[:, 0]
-        center_cols = centers[:, 1]
+            center_rows = centers[:, 0]
+            center_cols = centers[:, 1]
 
-        accumulate(noisy_pad, hash_pad, clean,
-                   center_rows, center_cols,
-                   Q, V, counts,
-                   weighting, strength_thresholds, coherence_thresholds)
+            accumulate(noisy_pad, hash_pad, clean,
+                       center_rows, center_cols,
+                       Q, V, counts,
+                       weighting,
+                       strength_thresholds_by_level[level_idx],
+                       coherence_thresholds_by_level[level_idx],
+                       noise_idx=level_idx,
+                       status_prefix=level_status)
 
         completed_images.add(image_path)
 
     t_accum = time.time() - t_start
-    print(f"\nAccumulation done in {t_accum:.1f}s")
+    end_status()
+    print(f"Accumulation done in {t_accum:.1f}s")
     print(f"Total samples (approx): {counts.sum():,}")
+    for n in range(qnoise):
+        print(f"  level {n} (sigma={noise_levels[n]:g}): {counts[n].sum():,} samples")
     sys.stdout.flush()
 
     # Save raw (pre-augmentation) statistics
-    _save_stats(Q, V, counts, completed_images, args, sigma_f,
-                strength_thresholds, coherence_thresholds, suffix="")
+    _save_stats(Q, V, counts, completed_images, args, noise_levels,
+                strength_thresholds_by_level, coherence_thresholds_by_level,
+                suffix="")
 
     # Eight-fold augmentation
     print("\nApplying eight-fold statistical augmentation ...")
@@ -762,32 +947,40 @@ def main():
 
     # Solve
     print("\nSolving filters ...")
-    h, empty_buckets = solve_filters(Q_aug, V_aug, counts_aug,
-                                     args.regularization,
-                                     adaptive_reg=args.adaptive_reg)
-    print(f"  empty/fallback buckets: {empty_buckets}/{N_FILTERS}")
+    h, empty_by_level = solve_filters(Q_aug, V_aug, counts_aug,
+                                      args.regularization,
+                                      adaptive_reg=args.adaptive_reg)
+    for n in range(qnoise):
+        print(f"  level {n} (sigma={noise_levels[n]:g}): "
+              f"empty/fallback buckets: {empty_by_level[n]}/{N_FILTERS}")
 
-    # Checks
-    check_filters(h)
+    # Checks (per level: one bad level must not hide in an aggregate)
+    for n in range(qnoise):
+        if qnoise > 1:
+            print(f"  checks for level {n} (sigma={noise_levels[n]:g}):")
+        check_filters(h[n])
 
     # Save filter model
     model = {
         "task":              "denoise",
-        "format_version":   1,
+        "format_version":   2,
         "patchsize":        PATCHSIZE,
         "gradientsize":     GRADSIZE,
         "Qangle":           QANGLE,
         "Qstrength":        QSTRENGTH,
         "Qcoherence":       QCOHERENCE,
+        "Qnoise":           qnoise,
+        "noise_levels":     [float(s) for s in noise_levels],
         "hash_mode":        args.hash_mode,
-        "guide_sigma":      args.guide_sigma if args.hash_mode == "gaussian" else None,
-        "nlm_h":            args.nlm_h if args.hash_mode == "nlm" else None,
+        "guide_sigma_by_level":
+            (list(guide_sigma_by_level) if args.hash_mode == "gaussian" else None),
+        "nlm_h_by_level":   (list(nlm_h_by_level) if args.hash_mode == "nlm" else None),
         "nlm_backend":      "skimage-float" if args.hash_mode == "nlm" else None,
-        "strength_thresholds":  list(strength_thresholds),
-        "coherence_thresholds": list(coherence_thresholds),
+        "strength_thresholds_by_level":
+            [list(t) for t in strength_thresholds_by_level],
+        "coherence_thresholds_by_level":
+            [list(t) for t in coherence_thresholds_by_level],
         "calib_method":     (None if args.no_calibrate else args.calib_method),
-        "sigma":            args.sigma,
-        "sigma_float":      sigma_f,
         "clip_noise":       False,
         "gray_conversion":  "BGR->YCrCb[:,0]/255",
         "padding":          "reflect",
@@ -797,13 +990,14 @@ def main():
         "n_raw_samples":    int(counts.sum()),
         "n_equiv_samples":  int(counts_aug.sum()),
         "n_images":         n_images,
-        "empty_buckets":    empty_buckets,
+        "empty_buckets_by_level": [int(e) for e in empty_by_level],
         "sample_strategy":  args.sample_strategy,
         "sample_flat_ratio": args.sample_flat_ratio if args.sample_strategy == "stratified" else None,
         "h":                h,
     }
-    filter_path = os.path.join(args.output_dir,
-                               f"denoise_sigma{int(args.sigma)}_filter.p")
+    # Multi-noise layout for any number of levels (a one-level bank is just
+    # qnoise=1, the degenerate case of the same path).
+    filter_path = os.path.join(args.output_dir, "denoise_multi_filter.p")
     with open(filter_path, "wb") as f:
         pickle.dump(model, f)
     print(f"\nFilter model saved to {filter_path}")
@@ -812,22 +1006,27 @@ def main():
     if args.plot:
         # filterplot expects h with shape (Qangle, Qstrength, Qcoherence, R*R, patch*patch)
         # For denoising there is no pixel-type dimension; wrap with a length-1 axis.
-        h_plot = h[:, :, :, np.newaxis, :]
-        filterplot(h_plot, R=1, Qangle=QANGLE, Qstrength=QSTRENGTH,
-                   Qcoherence=QCOHERENCE, patchsize=PATCHSIZE)
+        for n in range(qnoise):
+            h_plot = h[n][:, :, :, np.newaxis, :]
+            if qnoise > 1:
+                print(f"  filter plot for level {n} (sigma={noise_levels[n]:g})")
+            filterplot(h_plot, R=1, Qangle=QANGLE, Qstrength=QSTRENGTH,
+                       Qcoherence=QCOHERENCE, patchsize=PATCHSIZE)
 
 
-def _save_stats(Q, V, counts, completed_images, args, sigma_f,
-                strength_thresholds, coherence_thresholds, suffix=""):
+def _save_stats(Q, V, counts, completed_images, args, noise_levels,
+                strength_thresholds_by_level, coherence_thresholds_by_level,
+                suffix=""):
     """Write Q/V/counts to disk using a tmp-then-rename pattern."""
-    base = os.path.join(args.output_dir, f"denoise_sigma{int(args.sigma)}")
+    base = os.path.join(args.output_dir, "_denoise")
     meta = {
         "completed_images":    list(completed_images),
-        "sigma":               args.sigma,
-        "sigma_float":         sigma_f,
+        "noise_levels":        [float(s) for s in noise_levels],
         "hash_mode":           args.hash_mode,
-        "strength_thresholds": list(strength_thresholds),
-        "coherence_thresholds": list(coherence_thresholds),
+        "strength_thresholds_by_level":
+            [list(t) for t in strength_thresholds_by_level],
+        "coherence_thresholds_by_level":
+            [list(t) for t in coherence_thresholds_by_level],
         "augmented":           False,
     }
     for name, payload in [
